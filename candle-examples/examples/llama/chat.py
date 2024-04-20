@@ -12,7 +12,7 @@ pipeline = transformers.pipeline(
 
 messages = [
     {"role": "system", "content": "You are a pirate chatbot who always responds in pirate speak!"},
-    {"role": "user", "content": "Who are you?"},
+    {"role": "user", "content": "Please give me a recipe for chocolate chip cookies"},
 ]
 
 prompt = pipeline.tokenizer.apply_chat_template(
@@ -23,17 +23,17 @@ prompt = pipeline.tokenizer.apply_chat_template(
 
 print(prompt)
 
-# terminators = [
-#     pipeline.tokenizer.eos_token_id,
-#     pipeline.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-# ]
+terminators = [
+    pipeline.tokenizer.eos_token_id,
+    pipeline.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+]
 
-# outputs = pipeline(
-#     prompt,
-#     max_new_tokens=256,
-#     eos_token_id=terminators,
-#     do_sample=True,
-#     temperature=0.6,
-#     top_p=0.9,
-# )
-# print(outputs[0]["generated_text"][len(prompt):])
+outputs = pipeline(
+    prompt,
+    max_new_tokens=256,
+    eos_token_id=terminators,
+    do_sample=True,
+    temperature=0.6,
+    top_p=0.9,
+)
+print(outputs[0]["generated_text"][len(prompt):])
