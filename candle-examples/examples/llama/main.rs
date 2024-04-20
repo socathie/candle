@@ -156,13 +156,18 @@ fn main() -> Result<()> {
     let eos_token_id = config
         .eos_token_id
         .or_else(|| tokenizer.token_to_id(EOS_TOKEN));
-    let prompt = args.prompt.as_ref().map_or(DEFAULT_PROMPT, |p| p.as_str());
+    let args_prompt = args.prompt.as_ref().map_or(DEFAULT_PROMPT, |p| p.as_str());
+
+    let prompt = format!("<|begin_of_text|><|start_header_id|>system<|end_header_id|>You are a pirate chatbot who always responds in pirate speak!<|eot_id|><|start_header_id|>user<|end_header_id|>{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>", args_prompt);
+
     let mut tokens = tokenizer
-        .encode(prompt, true)
+        .encode(prompt.clone(), false)
         .map_err(E::msg)?
         .get_ids()
         .to_vec();
     let mut tokenizer = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+        
+    let prompt_len = tokens.len();
 
     println!("starting the inference loop");
     print!("{prompt}");
@@ -199,19 +204,21 @@ fn main() -> Result<()> {
         if Some(next_token) == eos_token_id {
             break;
         }
-        if let Some(t) = tokenizer.next_token(next_token)? {
-            print!("{t}");
-            std::io::stdout().flush()?;
-        }
+        // if let Some(t) = tokenizer.next_token(next_token)? {
+        //     print!("{t}");
+        //     std::io::stdout().flush()?;
+        // }
     }
-    if let Some(rest) = tokenizer.decode_rest().map_err(E::msg)? {
-        print!("{rest}");
-    }
+    // if let Some(rest) = tokenizer.decode_rest().map_err(E::msg)? {
+    //     print!("{rest}");
+    // }
     let dt = start_gen.elapsed();
     println!(
         "\n\n{} tokens generated ({} token/s)\n",
         token_generated,
         token_generated as f64 / dt.as_secs_f64(),
     );
+    let output = tokenizer.decode(&tokens[prompt_len..]).map_err(E::msg)?;
+    println!("{}", output);
     Ok(())
 }
