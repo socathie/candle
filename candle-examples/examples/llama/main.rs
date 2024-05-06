@@ -158,7 +158,7 @@ fn main() -> Result<()> {
         .or_else(|| tokenizer.token_to_id(EOS_TOKEN));
     let args_prompt = args.prompt.as_ref().map_or(DEFAULT_PROMPT, |p| p.as_str());
 
-    let prompt = format!("<|begin_of_text|><|start_header_id|>system<|end_header_id|>You are a pirate chatbot who always responds in pirate speak!<|eot_id|><|start_header_id|>user<|end_header_id|>{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>", args_prompt);
+    let prompt = format!("<|begin_of_text|><|start_header_id|>user<|end_header_id|>{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>", args_prompt);
 
     let mut tokens = tokenizer
         .encode(prompt.clone(), false)
@@ -201,7 +201,7 @@ fn main() -> Result<()> {
         token_generated += 1;
         tokens.push(next_token);
 
-        if Some(next_token) == eos_token_id {
+        if Some(next_token) == Some(128001) || Some(next_token) == Some(128009) {
             break;
         }
         // if let Some(t) = tokenizer.next_token(next_token)? {
