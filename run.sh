@@ -1,1 +1,0 @@
-cargo run --example llama --release --features metal -- --prompt "Write a short story about a unicorn and a postbox using only emojis." --which v3-instruct --sample-len 256 --seed 460 --temperature 0.6 --top-p 0.9
