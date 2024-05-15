@@ -17,7 +17,7 @@ use clap::{Parser, ValueEnum};
 
 use candle::{DType, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::generation::LogitsProcessor;
+use candle_transformers::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::io::Write;
 
@@ -54,12 +54,16 @@ struct Args {
     #[arg(long)]
     top_p: Option<f64>,
 
+    /// Only sample among the top K samples.
+    #[arg(long)]
+    top_k: Option<usize>,
+
     /// The seed to use when generating random samples.
     #[arg(long, default_value_t = 299792458)]
     seed: u64,
 
     /// The length of the sample to generate (in tokens).
-    #[arg(long, default_value_t = 10000)]
+    #[arg(short = 'n', long, default_value_t = 10000)]
     sample_len: usize,
 
     /// Disable the key-value cache.
@@ -85,7 +89,7 @@ struct Args {
     revision: Option<String>,
 
     /// The model size to use.
-    #[arg(long, default_value = "v2")]
+    #[arg(long, default_value = "v3")]
     which: Which,
 
     #[arg(long)]
@@ -171,8 +175,22 @@ fn main() -> Result<()> {
 
     println!("starting the inference loop");
     print!("{prompt}");
-    let mut logits_processor = LogitsProcessor::new(args.seed, Some(args.temperature), args.top_p);
-    let start_gen = std::time::Instant::now();
+    let mut logits_processor = {
+        let temperature = args.temperature;
+        let sampling = if temperature <= 0. {
+            Sampling::ArgMax
+        } else {
+            match (args.top_k, args.top_p) {
+                (None, None) => Sampling::All { temperature },
+                (Some(k), None) => Sampling::TopK { k, temperature },
+                (None, Some(p)) => Sampling::TopP { p, temperature },
+                (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
+            }
+        };
+        LogitsProcessor::from_sampling(args.seed, sampling)
+    };
+
+    let mut start_gen = std::time::Instant::now();
     let mut index_pos = 0;
     let mut token_generated = 0;
     for index in 0..args.sample_len {
@@ -181,6 +199,9 @@ fn main() -> Result<()> {
         } else {
             (tokens.len(), 0)
         };
+        if index == 1 {
+            start_gen = std::time::Instant::now()
+        }
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
         let input = Tensor::new(ctxt, &device)?.unsqueeze(0)?;
         let logits = llama.forward(&input, context_index, &mut cache)?;
@@ -216,7 +237,7 @@ fn main() -> Result<()> {
     println!(
         "\n\n{} tokens generated ({} token/s)\n",
         token_generated,
-        token_generated as f64 / dt.as_secs_f64(),
+        (token_generated - 1) as f64 / dt.as_secs_f64(),
     );
     let output = tokenizer.decode(&tokens[prompt_len..]).map_err(E::msg)?;
     println!("{}", output);

@@ -96,6 +96,40 @@ fn clamp(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn asort(device: &Device) -> Result<()> {
+    let data = &[[3f32, 1., 4., 1.1, 5.], [2.1, 1., 7., 8., 2.]];
+    let tensor = Tensor::new(data, device)?;
+    let indexes = tensor.arg_sort_last_dim(true)?;
+    assert_eq!(
+        indexes.to_vec2::<u32>()?,
+        [[1, 3, 0, 2, 4], [1, 4, 0, 2, 3]],
+    );
+    let indexes = tensor.arg_sort_last_dim(false)?;
+    assert_eq!(
+        indexes.to_vec2::<u32>()?,
+        [[4, 2, 0, 3, 1], [3, 2, 0, 4, 1]],
+    );
+    let (sorted, indexes) = tensor.sort_last_dim(true)?;
+    assert_eq!(
+        indexes.to_vec2::<u32>()?,
+        [[1, 3, 0, 2, 4], [1, 4, 0, 2, 3]],
+    );
+    assert_eq!(
+        sorted.to_vec2::<f32>()?,
+        [[1.0, 1.1, 3.0, 4.0, 5.0], [1.0, 2.0, 2.1, 7.0, 8.0]]
+    );
+    let (sorted, indexes) = tensor.sort_last_dim(false)?;
+    assert_eq!(
+        indexes.to_vec2::<u32>()?,
+        [[4, 2, 0, 3, 1], [3, 2, 0, 4, 1]],
+    );
+    assert_eq!(
+        sorted.to_vec2::<f32>()?,
+        [[5.0, 4.0, 3.0, 1.1, 1.0], [8.0, 7.0, 2.1, 2.0, 1.0]]
+    );
+    Ok(())
+}
+
 fn unary_op(device: &Device) -> Result<()> {
     let data = &[[-3f32, 1., 4., -0.1, 0.5], [2.7, -1.8, -0.28, 1.8, 2.8]];
     let tensor = Tensor::new(data, device)?;
@@ -1151,6 +1185,7 @@ test_device!(
 );
 test_device!(randn, randn_cpu, randn_gpu, randn_metal);
 test_device!(clamp, clamp_cpu, clamp_gpu, clamp_metal);
+test_device!(asort, asort_cpu, asort_gpu, asort_metal);
 test_device!(var, var_cpu, var_gpu, var_metal);
 test_device!(zero_dim, zero_dim_cpu, zero_dim_gpu, zero_dim_metal);
 

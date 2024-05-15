@@ -1,30 +1,21 @@
-use crate::models::with_tracing::{linear, linear_no_bias, Linear, RmsNorm};
 use candle::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{Activation, VarBuilder};
+use candle_nn::{linear_b, linear_no_bias, Activation, LayerNorm, Linear, VarBuilder};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    pub attention_bias: bool,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    pub hidden_act: candle_nn::Activation,
     pub max_position_embeddings: usize,
-    pub sliding_window: usize,
-    pub max_window_layers: usize,
-    pub tie_word_embeddings: bool,
     pub rope_theta: f64,
-    pub rms_norm_eps: f64,
-    pub use_sliding_window: bool,
-    pub hidden_act: Activation,
-    pub decoder_sparse_step: usize,
-    pub moe_intermediate_size: usize,
-    pub shared_expert_intermediate_size: usize,
-    pub num_experts_per_tok: usize,
-    pub num_experts: usize,
-    pub norm_topk_prob: bool,
+    pub tie_word_embeddings: bool,
+    pub clip_qkv: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,8 +69,9 @@ struct MLP {
 }
 
 impl MLP {
-    fn new(intermediate_sz: usize, cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
+        let intermediate_sz = cfg.intermediate_size;
         let gate_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("gate_proj"))?;
         let up_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("up_proj"))?;
         let down_proj = linear_no_bias(intermediate_sz, hidden_sz, vb.pp("down_proj"))?;
@@ -112,6 +104,7 @@ struct Attention {
     head_dim: usize,
     hidden_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
+    qkv_clip: Option<f64>,
     kv_cache: Option<(Tensor, Tensor)>,
 }
 
@@ -122,10 +115,12 @@ impl Attention {
         let num_kv_heads = cfg.num_key_value_heads;
         let num_kv_groups = num_heads / num_kv_heads;
         let head_dim = hidden_sz / num_heads;
-        let q_proj = linear(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?;
-        let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
+        let b = cfg.attention_bias;
+        let qkv_clip = cfg.clip_qkv;
+        let q_proj = linear_b(hidden_sz, num_heads * head_dim, b, vb.pp("q_proj"))?;
+        let k_proj = linear_b(hidden_sz, num_kv_heads * head_dim, b, vb.pp("k_proj"))?;
+        let v_proj = linear_b(hidden_sz, num_kv_heads * head_dim, b, vb.pp("v_proj"))?;
+        let o_proj = linear_b(num_heads * head_dim, hidden_sz, b, vb.pp("o_proj"))?;
         Ok(Self {
             q_proj,
             k_proj,
@@ -137,6 +132,7 @@ impl Attention {
             head_dim,
             hidden_size: hidden_sz,
             rotary_emb,
+            qkv_clip,
             kv_cache: None,
         })
     }
@@ -152,6 +148,16 @@ impl Attention {
         let query_states = self.q_proj.forward(xs)?;
         let key_states = self.k_proj.forward(xs)?;
         let value_states = self.v_proj.forward(xs)?;
+
+        let (query_states, key_states, value_states) = match &self.qkv_clip {
+            None => (query_states, key_states, value_states),
+            Some(qkv_clip) => {
+                let query_states = Tensor::clamp(&query_states, -qkv_clip, *qkv_clip)?;
+                let key_states = Tensor::clamp(&key_states, -qkv_clip, *qkv_clip)?;
+                let value_states = Tensor::clamp(&value_states, -qkv_clip, *qkv_clip)?;
+                (query_states, key_states, value_states)
+            }
+        };
 
         let query_states = query_states
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
@@ -203,150 +209,21 @@ impl Attention {
     }
 }
 
-// https://github.com/huggingface/transformers/blob/536ea2aca234fb48c5c69769431d643b0d93b233/src/transformers/models/qwen2_moe/modeling_qwen2_moe.py#L800
-#[derive(Debug, Clone)]
-struct SparseMoeBlock {
-    gate: Linear,
-    experts: Vec<MLP>,
-    shared_expert: MLP,
-    shared_expert_gate: Linear,
-    norm_topk_prob: bool,
-    num_experts_per_tok: usize,
-}
-
-impl SparseMoeBlock {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let gate = linear_no_bias(cfg.hidden_size, cfg.num_experts, vb.pp("gate"))?;
-        let mut experts = Vec::with_capacity(cfg.num_experts);
-        let vb_e = vb.pp("experts");
-        for idx in 0..cfg.num_experts {
-            let expert = MLP::new(cfg.moe_intermediate_size, cfg, vb_e.pp(idx))?;
-            experts.push(expert)
-        }
-        let shared_expert = MLP::new(
-            cfg.shared_expert_intermediate_size,
-            cfg,
-            vb.pp("shared_expert"),
-        )?;
-        let shared_expert_gate = linear_no_bias(cfg.hidden_size, 1, vb.pp("shared_expert_gate"))?;
-        Ok(Self {
-            gate,
-            experts,
-            shared_expert,
-            shared_expert_gate,
-            norm_topk_prob: cfg.norm_topk_prob,
-            num_experts_per_tok: cfg.num_experts_per_tok,
-        })
-    }
-}
-
-impl Module for SparseMoeBlock {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (b_size, seq_len, hidden_dim) = xs.dims3()?;
-        let xs = xs.reshape(((), hidden_dim))?;
-        let router_logits = xs.apply(&self.gate)?;
-        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
-
-        // In order to extract topk, we extract the data from the tensor and manipulate it
-        // directly. Maybe we will want to use some custom ops instead at some point.
-        let experts_per_tok = routing_weights
-            .arg_sort_last_dim(false)?
-            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-            .contiguous()?;
-        let routing_weights = routing_weights.gather(&experts_per_tok, D::Minus1)?;
-
-        // routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        // top_x contains the row indexes to evaluate for each expert.
-        let routing_weights = routing_weights.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        let experts_per_tok = experts_per_tok.to_vec2::<u32>()?;
-        let mut top_x = vec![vec![]; self.experts.len()];
-        let mut selected_experts = vec![vec![]; self.experts.len()];
-        for (row_idx, (rw, expert_idxs)) in routing_weights
-            .iter()
-            .zip(experts_per_tok.iter())
-            .enumerate()
-        {
-            let sum_rw = rw.iter().sum::<f32>();
-            for (&rw, &expert_idx) in rw.iter().zip(expert_idxs.iter()) {
-                top_x[expert_idx as usize].push(row_idx as u32);
-                let rw = if self.norm_topk_prob { rw / sum_rw } else { rw };
-                selected_experts[expert_idx as usize].push(rw)
-            }
-        }
-
-        let mut ys = xs.zeros_like()?;
-        for (expert_idx, expert_layer) in self.experts.iter().enumerate() {
-            let top_x = &top_x[expert_idx];
-            if top_x.is_empty() {
-                continue;
-            }
-            let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
-            let selected_experts =
-                Tensor::new(selected_experts[expert_idx].as_slice(), xs.device())?
-                    .reshape(((), 1))?
-                    .to_dtype(xs.dtype())?;
-            // Index the correct hidden states and compute the expert hidden state for
-            // the current expert. We need to make sure to multiply the output hidden
-            // states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            let current_state = xs.index_select(&top_x, 0)?.reshape(((), hidden_dim))?;
-            // current_hidden_states = expert_layer(current_state, routing_weights[top_x_list, idx_list, None])
-            let current_hidden_states = expert_layer.forward(&current_state)?;
-            let current_hidden_states = current_hidden_states.broadcast_mul(&selected_experts)?;
-            ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
-        }
-        let shared_expert_output = xs.apply(&self.shared_expert)?;
-        let shared_expert_output = shared_expert_output.broadcast_mul(&candle_nn::ops::sigmoid(
-            &xs.apply(&self.shared_expert_gate)?,
-        )?)?;
-        let ys = (ys + shared_expert_output)?;
-        let ys = ys.reshape((b_size, seq_len, hidden_dim))?;
-        Ok(ys)
-    }
-}
-
-#[derive(Debug, Clone)]
-enum MlpOrMoeBlock {
-    Mlp(MLP),
-    MoeBlock(SparseMoeBlock),
-}
-
-impl Module for MlpOrMoeBlock {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::MoeBlock(m) => m.forward(xs),
-            Self::Mlp(m) => m.forward(xs),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct DecoderLayer {
     self_attn: Attention,
-    mlp: MlpOrMoeBlock,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    mlp: MLP,
+    input_layernorm: LayerNorm,
+    post_attention_layernorm: LayerNorm,
 }
 
 impl DecoderLayer {
-    fn new(
-        layer_idx: usize,
-        rotary_emb: Arc<RotaryEmbedding>,
-        cfg: &Config,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?;
-        let mlp = if cfg.num_experts > 0 && (layer_idx + 1) % cfg.decoder_sparse_step == 0 {
-            MlpOrMoeBlock::MoeBlock(SparseMoeBlock::new(cfg, vb.pp("mlp"))?)
-        } else {
-            MlpOrMoeBlock::Mlp(MLP::new(cfg.intermediate_size, cfg, vb.pp("mlp"))?)
-        };
-        let input_layernorm =
-            RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm = RmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
+        let mlp = MLP::new(cfg, vb.pp("mlp"))?;
+        let ln_weight = Tensor::ones(cfg.hidden_size, vb.dtype(), vb.device())?;
+        let input_layernorm = LayerNorm::new_no_bias(ln_weight.clone(), 1e-5);
+        let post_attention_layernorm = LayerNorm::new_no_bias(ln_weight.clone(), 1e-5);
         Ok(Self {
             self_attn,
             mlp,
@@ -379,9 +256,8 @@ impl DecoderLayer {
 pub struct Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
+    norm: LayerNorm,
     lm_head: Linear,
-    sliding_window: usize,
     device: Device,
     dtype: DType,
 }
@@ -395,17 +271,21 @@ impl Model {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(layer_idx, rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
+            let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
-        let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
-        let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        let ln_weight = Tensor::ones(cfg.hidden_size, vb.dtype(), vb.device())?;
+        let norm = LayerNorm::new_no_bias(ln_weight, 1e-5);
+        let lm_head = if cfg.tie_word_embeddings {
+            Linear::new(embed_tokens.embeddings().clone(), None)
+        } else {
+            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+        };
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
-            sliding_window: cfg.sliding_window,
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
@@ -419,19 +299,11 @@ impl Model {
     ) -> Result<Tensor> {
         // Sliding window mask?
         let mask: Vec<_> = (0..tgt_len)
-            .flat_map(|i| {
-                (0..tgt_len).map(move |j| {
-                    if i < j || j + self.sliding_window < i {
-                        f32::NEG_INFINITY
-                    } else {
-                        0.
-                    }
-                })
-            })
+            .flat_map(|i| (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0. }))
             .collect();
         let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
         let mask = if seqlen_offset > 0 {
-            let mask0 = Tensor::zeros((tgt_len, seqlen_offset), DType::F32, &self.device)?;
+            let mask0 = Tensor::zeros((tgt_len, seqlen_offset), self.dtype, &self.device)?;
             Tensor::cat(&[&mask0, &mask], D::Minus1)?
         } else {
             mask
