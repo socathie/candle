@@ -24,7 +24,7 @@ use std::io::Write;
 use candle_transformers::models::llama as model;
 use model::{Llama, LlamaConfig};
 
-const EOS_TOKEN: &str = "</s>";
+const EOS_TOKEN: &str = "<|eot_id|>";
 const DEFAULT_PROMPT: &str = "My favorite theorem is ";
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, ValueEnum)]
@@ -157,9 +157,8 @@ fn main() -> Result<()> {
         (Llama::load(vb, &config)?, tokenizer_filename, cache, config)
     };
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
-    let eos_token_id = config
-        .eos_token_id
-        .or_else(|| tokenizer.token_to_id(EOS_TOKEN));
+    let eos_token_id = tokenizer.token_to_id(EOS_TOKEN);
+
     let args_prompt = args.prompt.as_ref().map_or(DEFAULT_PROMPT, |p| p.as_str());
 
     let prompt = format!("<|begin_of_text|><|start_header_id|>user<|end_header_id|>{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>", args_prompt);
@@ -222,7 +221,7 @@ fn main() -> Result<()> {
         token_generated += 1;
         tokens.push(next_token);
 
-        if Some(next_token) == Some(128001) || Some(next_token) == Some(128009) {
+        if Some(next_token) == eos_token_id {
             break;
         }
         // if let Some(t) = tokenizer.next_token(next_token)? {
